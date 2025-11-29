@@ -1,0 +1,80 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.venv/
+env.bak/
+venv.bak/
+
+# UV
+.uv/
+uv.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project specific - output files
+*.mp4
+*.avi
+*.mov
+*.pkl
+*.npz
+*.pdf
+output_video.mp4
+input_parkour.mp4
+flip_in_beach.mp4
+feedback_report.pdf
+pro_kong_smplx.npz
+basicModel_*.pkl
+*.pt
+*.onnx
+
+# Models directory (too large for git)
+models/
+LAAS-CNRS-parkour-mocap-dataset/
+
+# Generated output files
+trajectory_video.mp4
+keypoints_3d.npz
+trajectory_data.npz
+vertices_all_frames.npz
+
+# Logs
+*.log
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
