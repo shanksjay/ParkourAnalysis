@@ -81,53 +81,128 @@ AI-powered parkour technique analysis tool that uses YOLO pose estimation and SM
 The SMPL-X body model files need to be downloaded separately:
 
 1. **Download SMPL-X models** from [SMPL-X website](https://smpl-x.is.tue.mpg.de/)
-2. **Extract** the model files to the project directory
-3. The code expects `basicModel_neutral_lbs_10_207_0_v1.1.0.pkl` in the current directory
+   - You'll need to register and request access
+   - Download the model files (SMPLX_NEUTRAL.pkl, SMPLX_NEUTRAL.npz, etc.)
 
-Alternatively, SMPLX will auto-download models on first use if you have the model path configured.
+2. **Extract** the model files to the project directory:
+   ```bash
+   mkdir -p models/smplx
+   # Extract downloaded files to models/smplx/
+   ```
+
+3. **Model Structure**: The code expects models in `models/smplx/`:
+   ```
+   models/smplx/
+   ├── SMPLX_NEUTRAL.pkl
+   ├── SMPLX_NEUTRAL.npz
+   ├── SMPLX_MALE.pkl (optional)
+   ├── SMPLX_FEMALE.pkl (optional)
+   └── ... (other model files)
+   ```
+
+4. **Model Loading**: The system will automatically:
+   - Detect available models in `models/smplx/`
+   - Use SMPLX_NEUTRAL.pkl for neutral gender analysis
+   - Display model information on startup
+   - Fall back to alternative paths if needed
 
 ## Usage
+
+### Command Line Options
+
+The script accepts an optional video path argument:
+
+```bash
+# Use default video (flip_in_beach.mp4)
+python parkour_analysis.py
+
+# Specify custom video path
+python parkour_analysis.py /path/to/your/video.mp4
+
+# Relative path also works
+python parkour_analysis.py my_parkour_video.mp4
+```
 
 ### Basic Usage
 
 1. **Prepare your video**:
    - Place your parkour video file in the project directory
-   - Name it `input_parkour.mp4` (or modify the path in code)
+   - Default video name: `flip_in_beach.mp4` (or specify via command line)
 
 2. **Run the analysis**:
    ```bash
+   # Use default video (flip_in_beach.mp4)
    python parkour_analysis.py
+   
+   # Or specify a custom video path
+   python parkour_analysis.py path/to/your/video.mp4
    ```
 
 3. **Output files** (generated in project directory):
    - `output_video.mp4`: Processed video with overlays and feedback
-   - `trajectory_video.mp4`: Trajectory visualization showing movement path
+   - `trajectory_video.mp4`: Trajectory visualization overlaid on original video (camera view)
    - `feedback_report.pdf`: Detailed technique analysis report
    - `keypoints_3d.npz`: 3D keypoints data for all frames
    - `trajectory_data.npz`: Trajectory positions (hip, head, center of mass)
    - `vertices_all_frames.npz`: 3D mesh vertices for all frames
    - `pro_kong_smplx.npz`: Professional reference data (auto-generated if not present)
 
-### Custom Video Path
+### Viewing NPZ Files
 
-Modify the `main()` function call or pass a custom path:
+Use the included utility to inspect generated NPZ files:
 
-```python
-if __name__ == "__main__":
-    main(video_path="path/to/your/video.mp4")
+```bash
+# View all available NPZ files
+python view_npz.py
+
+# View a specific file
+python view_npz.py keypoints_3d.npz
+
+# View with limited output
+python view_npz.py trajectory_data.npz --max-items 5
 ```
 
 ## How It Works
 
-1. **Video Input**: Reads video frames sequentially
-2. **Pose Detection**: YOLOv8 pose model detects human keypoints in 2D
-3. **3D Reconstruction**: 2D keypoints are lifted to 3D using SMPL-X body model
-4. **Technique Analysis**: Analyzes:
-   - Knee bend angles (should be ~140° for proper vault)
-   - Jump height (target: 1.2m+)
-   - Landing form (knee flexion for soft landing)
-5. **Pro Comparison**: Overlays professional reference movements for comparison
-6. **Feedback Generation**: Provides real-time feedback and generates PDF report
+### Processing Pipeline
+
+1. **Video Input**: 
+   - Reads video frames sequentially from input file
+   - Stores original frames for trajectory visualization
+   - Supports custom video paths via command line argument
+
+2. **Pose Detection**: 
+   - YOLOv8 pose model detects human keypoints in 2D
+   - Tracks the main athlete (largest bounding box)
+   - Extracts 17 COCO-format keypoints per frame
+
+3. **3D Reconstruction**: 
+   - 2D keypoints are converted to 3D using SMPL-X body model
+   - Estimates depth from keypoint bounding box size
+   - Generates full 3D mesh vertices and joint positions
+   - Uses neutral gender SMPL-X model for general analysis
+
+4. **Technique Analysis**: 
+   - Analyzes knee bend angles (target: ~140° for proper vault)
+   - Calculates jump height from hip position (target: 1.2m+)
+   - Evaluates landing form (knee flexion for soft landing)
+   - Provides frame-by-frame feedback
+
+5. **Trajectory Tracking**: 
+   - Tracks hip position, head position, and center of mass
+   - Projects 3D trajectory to 2D using camera view
+   - Overlays trajectory path on original video frames
+   - Color-codes trajectory (blue = start, red = end)
+
+6. **Pro Comparison**: 
+   - Overlays professional reference movements for comparison
+   - Shows synthetic reference data (can be replaced with real LAAS dataset)
+
+7. **Output Generation**: 
+   - Generates main analysis video with feedback overlays
+   - Creates trajectory visualization video matching camera view
+   - Saves intermediate artifacts (keypoints, trajectory, vertices)
+   - Generates PDF report with technique scores
 
 ## Analysis Metrics
 
@@ -143,7 +218,7 @@ The system analyzes:
 - **Pro Overlay**: Semi-transparent professional reference overlay
 - **Slow-motion**: Automatically slows down frames with technique mistakes
 - **PDF Report**: Comprehensive feedback report with scores and recommendations
-- **Trajectory Visualization**: Top-down view of movement path through 3D space
+- **Trajectory Visualization**: Movement path overlaid on original video matching camera view
 - **Intermediate Artifacts**: Saved 3D keypoints, trajectory data, and mesh vertices for further analysis
 
 ## Project Structure
@@ -155,22 +230,24 @@ parkour_analysis/
 ├── parkour_analysis.py    # Main analysis script
 ├── pyproject.toml         # UV/pip project configuration
 ├── requirements.txt       # Python dependencies
-├── requirements-base.txt  # Base dependencies (without PyTorch)
 ├── setup.sh              # Automated setup script
+├── view_npz.py           # Utility to view NPZ file contents
 ├── README.md             # This file
 ├── .gitignore            # Git ignore patterns
 └── models/               # SMPL-X model directory (user-provided)
     └── smplx/
         ├── SMPLX_NEUTRAL.pkl
         ├── SMPLX_NEUTRAL.npz
+        ├── SMPLX_MALE.pkl (optional)
+        ├── SMPLX_FEMALE.pkl (optional)
         └── ... (other model files)
 ```
 
 ### Input Files (User-Provided)
 
 ```
-├── input_parkour.mp4     # Input video file (or specify custom path)
-└── flip_in_beach.mp4     # Alternative input video name
+├── flip_in_beach.mp4     # Default input video file
+└── [custom].mp4          # Any video file (specify via command line)
 ```
 
 ### Generated Output Files
@@ -188,7 +265,7 @@ parkour_analysis/
 **Output File Descriptions:**
 
 - **output_video.mp4**: Main processed video with real-time feedback, technique analysis, and pro comparison overlays
-- **trajectory_video.mp4**: Top-down visualization showing the athlete's movement path through 3D space with color-coded trajectory
+- **trajectory_video.mp4**: Trajectory visualization overlaid on original video frames, showing movement path from the same camera perspective with color-coded trajectory (blue = start, red = end)
 - **feedback_report.pdf**: Detailed technique analysis with scores and recommendations
 - **keypoints_3d.npz**: NumPy archive containing 3D keypoint coordinates for each frame (useful for further analysis)
 - **trajectory_data.npz**: Trajectory data including hip positions, head positions, and center of mass for motion analysis
@@ -208,10 +285,15 @@ parkour_analysis/
 
 ## Performance Notes
 
-- **MPS Acceleration**: Automatically uses Apple Silicon GPU if available
-- **Frame Processing**: Processes frames sequentially (can be parallelized)
-- **Model Loading**: YOLO and SMPL-X models load on first run (may take time)
-- **Memory Usage**: Moderate - processes one frame at a time
+- **MPS Acceleration**: Automatically uses Apple Silicon GPU if available (M1/M2/M3)
+- **Frame Processing**: Processes frames sequentially with progress updates every 30 frames
+- **Model Loading**: 
+  - YOLO model auto-downloads on first run (~6MB)
+  - SMPL-X models must be downloaded separately (~500MB per model)
+  - Models load once and are reused for all frames
+- **Memory Usage**: Moderate - processes one frame at a time, stores frames for trajectory video
+- **Processing Speed**: ~18-26ms per frame on Apple Silicon with MPS
+- **Output Generation**: Trajectory video generation happens after main processing completes
 
 ## Troubleshooting
 
@@ -227,7 +309,10 @@ model = YOLO("yolov8n-pose.pt")  # Will download automatically
 
 If you get errors about SMPL-X model:
 1. Download models from [SMPL-X website](https://smpl-x.is.tue.mpg.de/)
-2. Update the `model_path` in the code to point to your model file
+2. Ensure models are in `models/smplx/` directory
+3. Check that `SMPLX_NEUTRAL.pkl` exists in the models directory
+4. The code will automatically detect and load models from `models/smplx/`
+5. If using a different path, the code will try alternative locations automatically
 
 ### MPS Not Available
 
@@ -260,15 +345,32 @@ If video output doesn't play:
 - Try changing the codec in `cv2.VideoWriter_fourcc(*'mp4v')` to `'avc1'` or `'x264'`
 - Ensure ffmpeg is installed for better codec support
 
+## Workflow Summary
+
+1. **Setup**: Install dependencies and download SMPL-X models
+2. **Input**: Provide video file (default: `flip_in_beach.mp4` or specify path)
+3. **Processing**: 
+   - System loads YOLO and SMPL-X models
+   - Processes each frame: pose detection → 3D reconstruction → analysis
+   - Stores intermediate data (keypoints, trajectory, vertices)
+4. **Output**: 
+   - Main analysis video with feedback
+   - Trajectory video with camera-matched overlay
+   - PDF report with technique scores
+   - NPZ files for further analysis
+5. **Analysis**: Use `view_npz.py` to inspect generated data files
+
 ## Future Enhancements
 
 - [ ] Real-time webcam processing
 - [ ] Multiple movement types (not just Kong Vault)
-- [ ] More sophisticated 3D pose optimization
-- [ ] Integration with LAAS parkour dataset
+- [ ] More sophisticated 3D pose optimization using actual SMPL-X parameters
+- [ ] Integration with real LAAS parkour dataset (replace synthetic reference)
 - [ ] Web interface for easier use
 - [ ] Batch processing for multiple videos
 - [ ] Advanced tracking with ByteTrack
+- [ ] Interactive 3D visualization of trajectory
+- [ ] Export to common motion capture formats (BVH, FBX)
 
 ## References
 
