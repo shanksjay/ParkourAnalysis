@@ -1,12 +1,12 @@
 # Parkour Analysis System
 
-AI-powered parkour technique analysis tool that uses YOLO pose estimation and SMPL-X 3D body modeling to provide real-time feedback on parkour movements, comparing user performance against professional reference data.
+AI-powered parkour technique analysis tool that uses **SAM3 (Segment Anything Model 3)** for person tracking and trajectory generation, providing real-time feedback on parkour movements based on trajectory analysis.
 
 ## Features
 
-- 🎯 **Pose Detection**: Real-time human pose estimation using YOLOv8 pose model
-- 🤖 **3D Body Modeling**: SMPL-X parametric body model for accurate 3D pose reconstruction
-- 📊 **Technique Analysis**: Automatic analysis of knee angles, jump height, and landing form
+- 🎯 **Person Tracking**: Real-time person segmentation and tracking using SAM3 (Segment Anything Model 3)
+- 📍 **Trajectory Generation**: Automatic trajectory extraction from SAM3 segmentation masks
+- 📊 **Trajectory Analysis**: Automatic analysis of speed, acceleration, jump height, and movement smoothness
 - 👥 **Pro Comparison**: Overlay professional reference movements (e.g., Dom Tomato Kong Vault)
 - 📹 **Video Processing**: Process video files with frame-by-frame analysis
 - 📄 **PDF Reports**: Generate detailed feedback reports
@@ -76,35 +76,59 @@ AI-powered parkour technique analysis tool that uses YOLO pose estimation and SM
    pip install -r requirements.txt
    ```
 
-### Download SMPL-X Models
+### Install SAM3
 
-The SMPL-X body model files need to be downloaded separately:
+SAM3 (Segment Anything Model 3) is required for person tracking. If you have already cloned SAM3 into the `parkour_analysis` directory, install it:
 
-1. **Download SMPL-X models** from [SMPL-X website](https://smpl-x.is.tue.mpg.de/)
-   - You'll need to register and request access
-   - Download the model files (SMPLX_NEUTRAL.pkl, SMPLX_NEUTRAL.npz, etc.)
-
-2. **Extract** the model files to the project directory:
+1. **Install SAM3 from local directory**:
    ```bash
-   mkdir -p models/smplx
-   # Extract downloaded files to models/smplx/
+   cd sam3
+   pip install -e .
+   pip install -e ".[notebooks]"  # Optional: for notebook support
+   cd ..
    ```
 
-3. **Model Structure**: The code expects models in `models/smplx/`:
-   ```
-   models/smplx/
-   ├── SMPLX_NEUTRAL.pkl
-   ├── SMPLX_NEUTRAL.npz
-   ├── SMPLX_MALE.pkl (optional)
-   ├── SMPLX_FEMALE.pkl (optional)
-   └── ... (other model files)
+   Or if SAM3 is not yet cloned:
+   ```bash
+   git clone https://github.com/facebookresearch/sam3.git
+   cd sam3
+   pip install -e .
+   pip install -e ".[notebooks]"
+   cd ..
    ```
 
-4. **Model Loading**: The system will automatically:
-   - Detect available models in `models/smplx/`
-   - Use SMPLX_NEUTRAL.pkl for neutral gender analysis
-   - Display model information on startup
-   - Fall back to alternative paths if needed
+2. **Install Hugging Face Hub** (required for model downloads):
+   ```bash
+   # Make sure you're in the project's virtual environment
+   source .venv/bin/activate  # On macOS/Linux
+   # or
+   .venv\Scripts\activate  # On Windows
+   
+   # Install huggingface-hub (includes the CLI)
+   pip install huggingface-hub
+   # Or if using UV:
+   uv pip install huggingface-hub
+   ```
+
+3. **Authenticate with Hugging Face**:
+   - Request access to SAM3 model at: https://huggingface.co/facebook/sam3
+   - Once approved, authenticate (make sure virtual environment is activated):
+   ```bash
+   source .venv/bin/activate  # Activate virtual environment first
+   hf auth login  # Note: newer versions use 'hf auth login' instead of 'huggingface-cli login'
+   ```
+   - If `hf` command is not found, you can also use: `python -m huggingface_hub.cli.hf auth login`
+
+4. **Model Download**: SAM3 models will auto-download on first use, or download manually:
+   ```bash
+   hf download facebook/sam3
+   # Or: python -m huggingface_hub.cli.hf download facebook/sam3
+   ```
+
+**Note**: 
+- The code will automatically detect if SAM3 is installed or available in the local `sam3/` directory
+- SMPL-X models are optional when using SAM3. The system uses SAM3 for person tracking and trajectory generation directly from segmentation masks
+- If SAM3 is not available, the system will fall back to basic tracking
 
 ## Usage
 
@@ -171,46 +195,53 @@ python view_npz.py trajectory_data.npz --max-items 5
    - Stores original frames for trajectory visualization
    - Supports custom video paths via command line argument
 
-2. **Pose Detection**: 
-   - YOLOv8 pose model detects human keypoints in 2D
-   - Tracks the main athlete (largest bounding box)
-   - Extracts 17 COCO-format keypoints per frame
+2. **Person Tracking with SAM3**: 
+   - SAM3 video predictor segments person in each frame
+   - Uses text prompt "person" to identify and track the athlete
+   - Extracts segmentation masks for accurate person boundaries
+   - Calculates center of mass from mask for trajectory tracking
 
-3. **3D Reconstruction**: 
-   - 2D keypoints are converted to 3D using SMPL-X body model
-   - Estimates depth from keypoint bounding box size
-   - Generates full 3D mesh vertices and joint positions
-   - Uses neutral gender SMPL-X model for general analysis
+3. **Trajectory Generation**: 
+   - Extracts 2D center position from SAM3 segmentation mask
+   - Estimates depth from mask area (larger area = closer to camera)
+   - Converts 2D position to 3D trajectory coordinates
+   - Tracks position, speed, and movement patterns frame-by-frame
 
-4. **Technique Analysis**: 
-   - Analyzes knee bend angles (target: ~140° for proper vault)
-   - Calculates jump height from hip position (target: 1.2m+)
-   - Evaluates landing form (knee flexion for soft landing)
-   - Provides frame-by-frame feedback
+4. **Trajectory Analysis**: 
+   - **Speed Analysis**: Calculates current, average, and maximum speed
+   - **Height Analysis**: Tracks vertical position and jump height
+   - **Acceleration**: Monitors acceleration/deceleration patterns
+   - **Smoothness**: Evaluates trajectory smoothness and control
+   - **Distance**: Calculates total distance traveled
 
-5. **Trajectory Tracking**: 
-   - Tracks hip position, head position, and center of mass
-   - Projects 3D trajectory to 2D using camera view
+5. **Feedback Generation**: 
+   - Provides real-time feedback based on trajectory metrics
+   - Scores performance (0-10) based on speed, height, and smoothness
+   - Identifies areas for improvement (low speed, erratic movement, etc.)
+   - Highlights frames with technique mistakes
+
+6. **Trajectory Visualization**: 
    - Overlays trajectory path on original video frames
+   - Uses camera-matched projection for accurate visualization
    - Color-codes trajectory (blue = start, red = end)
-
-6. **Pro Comparison**: 
-   - Overlays professional reference movements for comparison
-   - Shows synthetic reference data (can be replaced with real LAAS dataset)
+   - Highlights current position in green
 
 7. **Output Generation**: 
-   - Generates main analysis video with feedback overlays
+   - Generates main analysis video with SAM3 mask overlay and feedback
    - Creates trajectory visualization video matching camera view
-   - Saves intermediate artifacts (keypoints, trajectory, vertices)
-   - Generates PDF report with technique scores
+   - Saves trajectory data (positions, speeds, metrics)
+   - Generates comprehensive PDF report with trajectory-based analysis
 
 ## Analysis Metrics
 
-The system analyzes:
+The system analyzes trajectory-based metrics:
 
-- **Knee Angle**: Measures knee flexion during vault (target: ~140°)
-- **Jump Height**: Calculates maximum hip height (target: 1.2m+)
-- **Landing Form**: Evaluates knee flexion on landing (should be <30° for soft landing)
+- **Speed**: Current, average, and maximum speed throughout movement
+- **Jump Height**: Maximum vertical displacement (Z coordinate)
+- **Acceleration**: Rate of speed change (positive = accelerating, negative = decelerating)
+- **Trajectory Smoothness**: Consistency of movement direction (higher = smoother)
+- **Total Distance**: Cumulative distance traveled in 3D space
+- **Performance Score**: Overall score (0-10) based on all metrics
 
 ## Output Features
 
@@ -275,13 +306,14 @@ parkour_analysis/
 
 - **opencv-python**: Video processing and image manipulation
 - **torch/torchvision**: Deep learning framework (with MPS support for Apple Silicon)
-- **ultralytics**: YOLOv8 pose estimation
-- **smplx**: SMPL-X parametric body model
-- **trimesh/pyrender**: 3D mesh processing and rendering
-- **scipy**: Scientific computing (rotation transforms)
+- **sam3**: Segment Anything Model 3 for person tracking and segmentation
+- **huggingface-hub**: Access to SAM3 model checkpoints
+- **transformers**: Required by SAM3
+- **scipy**: Scientific computing (rotation transforms, trajectory analysis)
 - **reportlab**: PDF report generation
 - **numpy**: Numerical computing
 - **matplotlib**: Plotting (for potential visualization)
+- **smplx**: SMPL-X parametric body model (optional, for advanced 3D analysis)
 
 ## Performance Notes
 
@@ -297,15 +329,22 @@ parkour_analysis/
 
 ## Troubleshooting
 
-### Model Download Issues
+### SAM3 Installation Issues
 
-If YOLO model doesn't auto-download:
-```python
-from ultralytics import YOLO
-model = YOLO("yolov8n-pose.pt")  # Will download automatically
-```
+If SAM3 is not available:
+1. Ensure SAM3 is installed: `git clone https://github.com/facebookresearch/sam3.git && cd sam3 && pip install -e .`
+2. Install `huggingface-hub` (includes the CLI): `pip install huggingface-hub` or `uv pip install huggingface-hub`
+3. **If `huggingface-cli` or `hf: command not found`**:
+   - Make sure you're in the correct virtual environment: `source .venv/bin/activate`
+   - Install huggingface-hub: `pip install huggingface-hub`
+   - Newer versions use `hf` command instead of `huggingface-cli`
+   - Verify installation: `which hf` or `which huggingface-cli`
+   - If neither works, use: `python -m huggingface_hub.cli.hf login`
+4. Authenticate with Hugging Face: `hf auth login` or `huggingface-cli login` (make sure virtual environment is activated)
+5. Request access to SAM3 model at: https://huggingface.co/facebook/sam3
+6. The system will fall back to basic tracking if SAM3 is unavailable
 
-### SMPL-X Model Path
+### SMPL-X Model Path (Optional)
 
 If you get errors about SMPL-X model:
 1. Download models from [SMPL-X website](https://smpl-x.is.tue.mpg.de/)

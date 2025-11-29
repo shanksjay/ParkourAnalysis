@@ -36,6 +36,7 @@ dependencies = [
     "trimesh>=3.20.0,<4.0.0",
     "pyrender>=0.1.45,<1.0.0",
     "chumpy>=0.70,<1.0.0",  # Required by smplx
+    "huggingface-hub>=0.19.0,<1.0.0",  # Required for SAM3 model downloads and CLI
 ]
 
 [project.optional-dependencies]
@@ -57,14 +58,6 @@ build-backend = "hatchling.build"
 # Extra build dependencies for packages that need them
 # Note: Install pip first with: uv pip install pip
 extra-build-dependencies = { "chumpy" = ["pip"] }
-
-# Dependency groups (replaces deprecated dev-dependencies)
-[tool.uv.dependency-groups]
-dev = [
-    "pytest>=7.0.0",
-    "black>=23.0.0",
-    "ruff>=0.1.0",
-]
 
 [tool.black]
 line-length = 100

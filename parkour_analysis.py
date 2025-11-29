@@ -7,17 +7,53 @@ try:
     import torch
     import numpy as np
     import matplotlib.pyplot as plt
-    from ultralytics import YOLO
     from scipy.spatial.transform import Rotation as R
     from reportlab.lib.pagesizes import letter
     from reportlab.pdfgen import canvas
     from smplx import SMPLX
     import trimesh
     import pyrender
-    from typing import List, Dict, Tuple
+    from typing import List, Dict, Tuple, Optional
     import urllib.request
     import zipfile
     import tempfile
+    
+    # SAM3 imports - try local installation first
+    SAM3_AVAILABLE = False
+    try:
+        # First try importing from installed package
+        from sam3.model_builder import build_sam3_video_predictor
+        SAM3_AVAILABLE = True
+        print("✓ SAM3 imported from installed package")
+    except ImportError:
+        try:
+            # Try importing from local sam3 directory
+            sam3_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sam3')
+            if os.path.exists(sam3_path) and os.path.exists(os.path.join(sam3_path, 'sam3', 'model_builder.py')):
+                # Add parent directory to path so we can import sam3
+                sys.path.insert(0, sam3_path)
+                from sam3.model_builder import build_sam3_video_predictor
+                SAM3_AVAILABLE = True
+                print(f"✓ Using local SAM3 installation from: {sam3_path}")
+            else:
+                print(f"Warning: SAM3 directory found at {sam3_path} but model_builder.py not found.")
+                print("Please install SAM3: cd sam3 && pip install -e .")
+                print("Falling back to basic tracking...")
+        except ImportError as e:
+            SAM3_AVAILABLE = False
+            missing_module = str(e).split("'")[1] if "'" in str(e) else "unknown"
+            print(f"⚠ Warning: SAM3 not available - missing dependency: {missing_module}")
+            print(f"   Error details: {e}")
+            print("SAM3 directory found but dependencies are missing.")
+            print("To install SAM3 and its dependencies:")
+            print("  1. cd sam3")
+            print("  2. pip install -e .")
+            print("  3. pip install -e '.[notebooks]'  # Optional: for notebook support")
+            print("  4. hf auth login  # Required for model downloads")
+            print("Or install missing dependency directly:")
+            print(f"  pip install {missing_module}")
+            print("Falling back to basic tracking...")
+        
 except ImportError as e:
     print(f"Error importing required modules: {e}")
     print("Please install all dependencies: pip install -r requirements.txt")
@@ -52,28 +88,148 @@ def download_pro_reference():
     np.savez("pro_kong_smplx.npz", **pro_params)
     print("Pro reference (synthetic) created; in prod, download from LAAS dataset.")
 
-# Simple ByteTrack stub (for demo; in prod: pip install lapx)
-class SimpleTracker:
-    def __init__(self):
-        self.track_id = 0
-    def update(self, results):
-        # YOLO returns a list of Results objects, get the first one
-        if isinstance(results, list):
-            if len(results) == 0:
-                return []
-            result = results[0]
+# SAM3-based Person Tracker
+class SAM3Tracker:
+    """Track person using SAM3 segmentation model"""
+    
+    def __init__(self, predictor=None, session_id=None, device=None):
+        self.predictor = predictor
+        self.session_id = session_id
+        self.frame_count = 0
+        self.last_mask = None
+        self.last_center = None
+        # Auto-detect device if not specified
+        if device is None:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+        self.device = device
+        
+    def initialize_session(self, video_path: str):
+        """Initialize SAM3 session with video"""
+        if not self.predictor:
+            if not SAM3_AVAILABLE:
+                raise RuntimeError("SAM3 not available. Please install sam3 package.")
+            # Pass device to predictor (will be used by Sam3VideoPredictor)
+            self.predictor = build_sam3_video_predictor(device=self.device)
+        
+        try:
+            response = self.predictor.handle_request(
+                request=dict(
+                    type="start_session",
+                    resource_path=video_path,
+                )
+            )
+            self.session_id = response["session_id"]
+            return self.session_id
+        except Exception as e:
+            print(f"Warning: Could not initialize SAM3 session: {e}")
+            return None
+    
+    def add_prompt(self, prompt: str = "person", frame_index: int = 0):
+        """Add text prompt to segment person"""
+        if not self.session_id or not self.predictor:
+            return None
+        
+        try:
+            response = self.predictor.handle_request(
+                request=dict(
+                    type="add_prompt",
+                    session_id=self.session_id,
+                    frame_index=frame_index,
+                    text=prompt,
+                )
+            )
+            return response
+        except Exception as e:
+            print(f"Warning: Could not add SAM3 prompt: {e}")
+            return None
+    
+    def get_mask(self, frame: np.ndarray, prompt: str = "person") -> Optional[np.ndarray]:
+        """Get segmentation mask for person in frame"""
+        if not self.predictor or not self.session_id:
+            return None
+        
+        try:
+            # Save frame temporarily for SAM3
+            temp_path = f"/tmp/sam3_frame_{self.frame_count}.jpg"
+            cv2.imwrite(temp_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            
+            # Add prompt for this frame
+            response = self.add_prompt(prompt, self.frame_count)
+            
+            if response and "outputs" in response:
+                outputs = response["outputs"]
+                if outputs and len(outputs) > 0:
+                    # Get mask from output
+                    mask = outputs[0].get("mask", None)
+                    if mask is not None:
+                        # Convert mask to numpy array if needed
+                        if isinstance(mask, torch.Tensor):
+                            mask = mask.cpu().numpy()
+                        self.last_mask = mask
+                        self.frame_count += 1
+                        return mask
+            
+            # Fallback: use last mask if available
+            return self.last_mask
+        except Exception as e:
+            print(f"Warning: SAM3 mask extraction failed: {e}")
+            return self.last_mask
+    
+    def get_center_from_mask(self, mask: np.ndarray) -> Optional[np.ndarray]:
+        """Extract center of mass from mask"""
+        if mask is None or mask.size == 0:
+            return None
+        
+        # Ensure mask is binary
+        if mask.dtype != np.uint8:
+            mask_binary = (mask > 0.5).astype(np.uint8) if mask.max() <= 1.0 else (mask > 127).astype(np.uint8)
         else:
-            result = results
+            mask_binary = (mask > 127).astype(np.uint8)
         
-        # Check if there are any detections
-        if result.boxes is None or len(result.boxes) == 0:
-            return []
+        # Find contours
+        contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
         
-        # Pick largest box as main athlete
-        areas = result.boxes.xyxy[:, 2] * result.boxes.xyxy[:, 3]
-        idx = np.argmax(areas)
-        box = result.boxes.xyxy[idx].cpu().numpy()
-        return [{'bbox': box, 'track_id': self.track_id, 'area': areas[idx]}]
+        # Get largest contour
+        largest_contour = max(contours, key=cv2.contourArea)
+        
+        # Calculate center of mass
+        M = cv2.moments(largest_contour)
+        if M["m00"] == 0:
+            return None
+        
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        
+        self.last_center = np.array([cx, cy])
+        return self.last_center
+    
+    def get_bbox_from_mask(self, mask: np.ndarray) -> Optional[np.ndarray]:
+        """Get bounding box from mask"""
+        if mask is None or mask.size == 0:
+            return None
+        
+        # Ensure mask is binary
+        if mask.dtype != np.uint8:
+            mask_binary = (mask > 0.5).astype(np.uint8) if mask.max() <= 1.0 else (mask > 127).astype(np.uint8)
+        else:
+            mask_binary = (mask > 127).astype(np.uint8)
+        
+        # Find bounding box
+        coords = np.column_stack(np.where(mask_binary > 0))
+        if len(coords) == 0:
+            return None
+        
+        y_min, x_min = coords.min(axis=0)
+        y_max, x_max = coords.max(axis=0)
+        
+        return np.array([x_min, y_min, x_max, y_max])
 
 # 2D Keypoints to 3D SMPL-X (simple kinematic lift; for demo)
 def keypoints_to_smplx(kp2d: np.ndarray, model: SMPLX, frame_shape: Tuple[int, int] = (640, 480)) -> Dict:
@@ -146,19 +302,110 @@ def keypoints_to_smplx(kp2d: np.ndarray, model: SMPLX, frame_shape: Tuple[int, i
         }
     }
 
-# Parkour Analysis
-def analyze_frame(joints3d: np.ndarray, frame_id: int, is_landing: bool = False) -> str:
-    # SMPL-X joint indices (approx: hip=0, kneeL=5, ankleL=8)
-    hip_y = joints3d[0,1]
-    knee_angle = np.degrees(np.arccos(np.clip((joints3d[0,2] - joints3d[5,2]) / 0.5, -1,1)))  # Dummy calc
-    feedback = []
-    if knee_angle < 120:
-        feedback.append(f"Knee too bent: {knee_angle:.0f}° → Drive harder!")
-    if hip_y < 1.1:
-        feedback.append(f"Low height: {hip_y:.1f}m → More explosion!")
-    if is_landing and knee_angle > 30:
-        feedback.append(f"Stiff landing: {knee_angle:.0f}° → Soften knees!")
-    return " | ".join(feedback) if feedback else "Solid technique!"
+# Trajectory-based Analysis
+def analyze_trajectory(trajectory_data: List[Dict], frame_id: int, fps: float = 30.0) -> Dict[str, any]:
+    """
+    Analyze trajectory to provide feedback on parkour technique.
+    
+    Returns:
+        Dictionary with metrics and feedback messages
+    """
+    if len(trajectory_data) < 2:
+        return {
+            'feedback': "Insufficient data for analysis",
+            'metrics': {},
+            'score': 5.0
+        }
+    
+    # Extract positions
+    positions = np.array([td['hip_position'] for td in trajectory_data[:frame_id+1]])
+    frame_ids = np.array([td['frame_id'] for td in trajectory_data[:frame_id+1]])
+    
+    if len(positions) < 2:
+        return {
+            'feedback': "Insufficient data for analysis",
+            'metrics': {},
+            'score': 5.0
+        }
+    
+    # Calculate metrics
+    metrics = {}
+    feedback_messages = []
+    
+    # 1. Speed analysis
+    if len(positions) >= 2:
+        # Calculate velocities (change in position per frame)
+        velocities = np.diff(positions, axis=0)
+        speeds = np.linalg.norm(velocities[:, :2], axis=1)  # 2D speed (X-Y plane)
+        metrics['current_speed'] = speeds[-1] if len(speeds) > 0 else 0.0
+        metrics['avg_speed'] = np.mean(speeds) if len(speeds) > 0 else 0.0
+        metrics['max_speed'] = np.max(speeds) if len(speeds) > 0 else 0.0
+        
+        if metrics['current_speed'] < 0.1:
+            feedback_messages.append("Low speed → Increase momentum!")
+        elif metrics['current_speed'] > 2.0:
+            feedback_messages.append("High speed → Good momentum!")
+    
+    # 2. Height analysis (Z coordinate)
+    if len(positions) >= 2:
+        heights = positions[:, 2]  # Z coordinate
+        metrics['current_height'] = heights[-1] if len(heights) > 0 else 0.0
+        metrics['max_height'] = np.max(heights) if len(heights) > 0 else 0.0
+        metrics['min_height'] = np.min(heights) if len(heights) > 0 else 0.0
+        metrics['jump_height'] = metrics['max_height'] - metrics['min_height']
+        
+        if metrics['jump_height'] < 0.5:
+            feedback_messages.append(f"Low jump: {metrics['jump_height']:.2f}m → More explosion!")
+        elif metrics['jump_height'] > 1.0:
+            feedback_messages.append(f"Good jump height: {metrics['jump_height']:.2f}m!")
+    
+    # 3. Acceleration analysis
+    if len(speeds) >= 2:
+        accelerations = np.diff(speeds)
+        metrics['current_acceleration'] = accelerations[-1] if len(accelerations) > 0 else 0.0
+        metrics['avg_acceleration'] = np.mean(accelerations) if len(accelerations) > 0 else 0.0
+        
+        if metrics['current_acceleration'] < -0.1:
+            feedback_messages.append("Decelerating → Maintain speed!")
+        elif metrics['current_acceleration'] > 0.1:
+            feedback_messages.append("Accelerating → Good power!")
+    
+    # 4. Trajectory smoothness (variance in direction)
+    if len(velocities) >= 3:
+        directions = velocities[:, :2] / (np.linalg.norm(velocities[:, :2], axis=1, keepdims=True) + 1e-6)
+        direction_changes = np.diff(directions, axis=0)
+        smoothness = 1.0 - np.mean(np.linalg.norm(direction_changes, axis=1))
+        metrics['smoothness'] = max(0, smoothness)
+        
+        if metrics['smoothness'] < 0.7:
+            feedback_messages.append("Erratic movement → Smooth out trajectory!")
+        elif metrics['smoothness'] > 0.9:
+            feedback_messages.append("Smooth trajectory → Excellent control!")
+    
+    # 5. Total distance traveled
+    if len(positions) >= 2:
+        distances = np.linalg.norm(np.diff(positions[:, :2], axis=0), axis=1)
+        metrics['total_distance'] = np.sum(distances) if len(distances) > 0 else 0.0
+    
+    # Calculate score (0-10)
+    score = 5.0  # Base score
+    if metrics.get('jump_height', 0) > 0.8:
+        score += 1.5
+    if metrics.get('max_speed', 0) > 1.5:
+        score += 1.0
+    if metrics.get('smoothness', 0) > 0.8:
+        score += 1.0
+    if metrics.get('current_acceleration', 0) > 0:
+        score += 0.5
+    score = min(10.0, max(0.0, score))
+    
+    feedback_text = " | ".join(feedback_messages) if feedback_messages else "Solid technique!"
+    
+    return {
+        'feedback': feedback_text,
+        'metrics': metrics,
+        'score': score
+    }
 
 # Render Mesh on Background
 def render_frame(vertices: np.ndarray, bg_img: np.ndarray, feedback: str) -> np.ndarray:
@@ -229,9 +476,15 @@ def render_trajectory_frame(trajectory_data: List[Dict], frame_id: int,
     if len(hip_positions) < 2:
         return img
     
-    # Use current frame's 2D keypoints for camera projection reference
-    if current_kp2d is not None and np.any(current_kp2d > 0):
-        kp_ref = current_kp2d
+    # Use current frame's 2D center for camera projection reference
+    if current_kp2d is not None:
+        # Handle both single point and array formats
+        if len(current_kp2d.shape) == 1:
+            kp_ref = current_kp2d.reshape(1, -1)
+        else:
+            kp_ref = current_kp2d
+        if not np.any(kp_ref > 0):
+            kp_ref = np.array([[frame_shape[0]/2, frame_shape[1]/2]])
     else:
         # Fallback: use frame center
         kp_ref = np.array([[frame_shape[0]/2, frame_shape[1]/2]])
@@ -300,15 +553,80 @@ def overlay_pro(pro_verts: np.ndarray, user_img: np.ndarray):
     cv2.putText(user_img, "Pro Overlay (Dom Tomato Kong)", (50,100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,0), 2)
     return user_img
 
-# Generate PDF Report
-def generate_pdf_report(feedbacks: List[str], scores: List[float], output_path: str):
+# Generate PDF Report based on trajectory analysis
+def generate_pdf_report(trajectory_data: List[Dict], feedbacks: List[str], scores: List[float], 
+                       output_path: str, fps: float = 30.0):
+    """Generate comprehensive PDF report based on trajectory analysis"""
     c = canvas.Canvas(output_path, pagesize=letter)
-    c.drawString(100, 750, "Parkour Technique Feedback Report")
+    
+    # Title
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(100, 750, "Parkour Technique Analysis Report")
+    c.drawString(100, 730, "Based on SAM3 Trajectory Tracking")
+    
     y = 700
-    for fb, score in zip(feedbacks, scores):
-        c.drawString(100, y, f"{fb} (Score: {score:.1f}/10)")
-        y -= 20
-    c.drawString(100, y-20, "Pro Comparison: Aim for 140° knee, 1.2m height like Dom Tomato.")
+    
+    # Overall Statistics
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(100, y, "Overall Performance Metrics:")
+    y -= 20
+    
+    if len(trajectory_data) > 0:
+        positions = np.array([td['hip_position'] for td in trajectory_data])
+        
+        # Calculate overall metrics
+        if len(positions) >= 2:
+            distances = np.linalg.norm(np.diff(positions[:, :2], axis=0), axis=1)
+            total_distance = np.sum(distances)
+            avg_speed = np.mean(distances) * fps if len(distances) > 0 else 0.0
+            max_height = np.max(positions[:, 2]) if len(positions) > 0 else 0.0
+            min_height = np.min(positions[:, 2]) if len(positions) > 0 else 0.0
+            jump_height = max_height - min_height
+            avg_score = np.mean(scores) if len(scores) > 0 else 0.0
+            
+            c.setFont("Helvetica", 10)
+            c.drawString(120, y, f"Total Distance Traveled: {total_distance:.2f} units")
+            y -= 15
+            c.drawString(120, y, f"Average Speed: {avg_speed:.2f} units/sec")
+            y -= 15
+            c.drawString(120, y, f"Maximum Jump Height: {jump_height:.2f} units")
+            y -= 15
+            c.drawString(120, y, f"Average Performance Score: {avg_score:.1f}/10")
+            y -= 20
+    
+    # Frame-by-frame feedback
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(100, y, "Frame-by-Frame Feedback:")
+    y -= 20
+    
+    c.setFont("Helvetica", 9)
+    # Show top 15 feedback entries
+    for i, (fb, score) in enumerate(zip(feedbacks[:15], scores[:15])):
+        if y < 50:  # New page if needed
+            c.showPage()
+            y = 750
+        c.drawString(120, y, f"Frame {i}: {fb[:60]} (Score: {score:.1f}/10)")
+        y -= 15
+    
+    # Recommendations
+    y -= 10
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(100, y, "Recommendations:")
+    y -= 20
+    
+    c.setFont("Helvetica", 10)
+    avg_score = np.mean(scores) if len(scores) > 0 else 0.0
+    if avg_score < 6.0:
+        c.drawString(120, y, "• Focus on maintaining consistent speed throughout movement")
+        y -= 15
+        c.drawString(120, y, "• Work on increasing jump height and explosion")
+        y -= 15
+        c.drawString(120, y, "• Practice smoother trajectory transitions")
+    else:
+        c.drawString(120, y, "• Excellent technique! Continue maintaining current form")
+        y -= 15
+        c.drawString(120, y, "• Consider pushing for even greater heights and speeds")
+    
     c.save()
     print(f"PDF saved: {output_path}")
 
@@ -326,112 +644,29 @@ def main(video_path: str = "flip_in_beach.mp4"):
     print("Downloading/generating pro reference data...")
     download_pro_reference()
     
-    print("Loading YOLO pose model (this may take a moment on first run)...")
-    try:
-        model = YOLO("yolov8n-pose.pt")  # YOLOv11 equiv; auto-download
-        print("YOLO model loaded successfully")
-    except Exception as e:
-        print(f"Error loading YOLO model: {e}")
-        return
+    # Initialize SAM3 tracker
+    print("Initializing SAM3 for person tracking...")
+    tracker = SAM3Tracker(device=device)
     
-    tracker = SimpleTracker()
-    
-    print("Loading SMPL-X model...")
-    try:
-        # SMPLX expects a directory path, not a specific .pkl file
-        smplx_dir = 'models/smplx'
-        
-        # Check if directory exists
-        if not os.path.exists(smplx_dir):
-            print(f"Warning: SMPL-X model directory not found at {smplx_dir}")
-            print("Trying alternative paths...")
-            # Try parent models directory
-            if os.path.exists('models'):
-                smplx_dir = 'models'
-            else:
-                print("Error: No SMPL-X model directory found.")
-                print("Please download SMPL-X models from: https://smpl-x.is.tue.mpg.de/")
-                print("Extract them to: models/smplx/")
-                return
-        
-        # Check if model files exist
-        neutral_pkl = os.path.join(smplx_dir, 'SMPLX_NEUTRAL.pkl')
-        neutral_npz = os.path.join(smplx_dir, 'SMPLX_NEUTRAL.npz')
-        
-        # List available files for debugging
-        if os.path.exists(smplx_dir):
-            print(f"Files in {smplx_dir}:")
-            for f in sorted(os.listdir(smplx_dir)):
-                file_path = os.path.join(smplx_dir, f)
-                size = os.path.getsize(file_path) / (1024 * 1024)  # Size in MB
-                print(f"  - {f} ({size:.1f} MB)")
-        
-        # Try to verify the .pkl file is valid
-        if os.path.exists(neutral_pkl):
-            try:
-                import pickle
-                with open(neutral_pkl, 'rb') as f:
-                    test_data = pickle.load(f)
-                print(f"✓ SMPLX_NEUTRAL.pkl is a valid pickle file")
-            except Exception as e:
-                print(f"⚠ Warning: SMPLX_NEUTRAL.pkl exists but may be corrupted: {e}")
-                print("Trying to use .npz format or directory loading...")
-        
-        # Try loading with directory path (SMPLX will auto-detect files)
-        print(f"Loading SMPL-X model from directory: {smplx_dir}")
-        
-        # Try different loading methods
-        smplx_model = None
-        load_methods = [
-            # Method 1: Directory with explicit parameters (neutral gender - correct for general use)
-            lambda: SMPLX(model_path=smplx_dir, model_type='smplx', gender='neutral', device=device),
-            # Method 2: Directory only (let SMPLX auto-detect, defaults to neutral)
-            lambda: SMPLX(model_path=smplx_dir, device=device),
-            # Method 3: Try with .npz if .pkl fails
-            lambda: SMPLX(model_path=neutral_npz if os.path.exists(neutral_npz) else smplx_dir, device=device),
-        ]
-        
-        for i, load_method in enumerate(load_methods, 1):
-            try:
-                print(f"  Trying load method {i}...")
-                smplx_model = load_method()
-                print(f"✓ Successfully loaded with method {i}")
-                break
-            except Exception as e:
-                print(f"  Method {i} failed: {e}")
-                if i == len(load_methods):
-                    raise
-        
-        if smplx_model is None:
-            raise RuntimeError("Failed to load SMPL-X model with all methods")
-        
-        # Ensure model is on the correct device
-        smplx_model = smplx_model.to(device)
-        model_device = next(smplx_model.parameters()).device
-        print(f"✓ SMPL-X model loaded successfully")
-        print(f"  - Device: {model_device}")
-        print(f"  - Gender: neutral (appropriate for general parkour analysis)")
-        print(f"  - Model type: SMPLX")
-        # Get model info (SMPLX has ~10475 vertices and 127 joints)
+    if SAM3_AVAILABLE:
         try:
-            test_output = smplx_model(torch.zeros(1, 10, device=model_device))
-            num_verts = test_output.vertices.shape[1]
-            num_joints = test_output.joints.shape[1] if hasattr(test_output, 'joints') else 0
-            print(f"  - Vertices: {num_verts} vertices")
-            if num_joints > 0:
-                print(f"  - Joints: {num_joints} joints")
-        except:
-            print(f"  - Model verified and ready")
-    except Exception as e:
-        print(f"Error loading SMPL-X model: {e}")
-        import traceback
-        traceback.print_exc()
-        print("\nTroubleshooting:")
-        print("1. Ensure SMPL-X models are downloaded from: https://smpl-x.is.tue.mpg.de/")
-        print("2. Extract models to: models/smplx/")
-        print("3. The directory should contain SMPLX_NEUTRAL.pkl (or .npz)")
-        print("4. Try using model_path='models/smplx' (directory, not file)")
-        return
+            session_id = tracker.initialize_session(video_path)
+            if session_id:
+                print("✓ SAM3 session initialized successfully")
+                # Add initial prompt for person tracking
+                tracker.add_prompt("person", 0)
+            else:
+                print("⚠ Warning: Could not initialize SAM3 session, using fallback tracking")
+        except Exception as e:
+            print(f"⚠ Warning: SAM3 initialization failed: {e}")
+            print("Continuing with basic tracking...")
+    else:
+        print("⚠ Warning: SAM3 not available, using basic tracking")
+    
+    # Note: SMPL-X model is optional when using SAM3 for tracking
+    # SAM3 provides trajectory directly from segmentation masks
+    print("Note: Using SAM3 for person tracking (SMPL-X model not required for trajectory analysis)")
+    smplx_model = None
     
     print(f"Opening video: {video_path}")
     cap = cv2.VideoCapture(video_path)
@@ -482,42 +717,65 @@ def main(video_path: str = "flip_in_beach.mp4"):
         # Store original frame for trajectory visualization
         original_frames.append(frame.copy())
         
-        # Detect & track
-        results = model(frame)
+        # Track person using SAM3
+        mask = tracker.get_mask(frame, "person")
+        center_2d = None
+        bbox = None
         
-        # YOLO returns a list, get first result
-        result = results[0] if isinstance(results, list) else results
+        if mask is not None:
+            # Get center of mass from mask
+            center_2d = tracker.get_center_from_mask(mask)
+            bbox = tracker.get_bbox_from_mask(mask)
         
-        # Pass the result to tracker (tracker handles both list and single result)
-        tracklets = tracker.update(result)
-        if not tracklets:
-            # Store empty keypoints for frames without detection
-            keypoints_2d_list.append(np.zeros((17, 2)))
-            out.write(cv2.cvtColor(bg, cv2.COLOR_RGB2BGR))
-            frame_id += 1
-            continue
-        main_track = tracklets[0]
-        bbox = main_track['bbox'].astype(int) * 2  # Scale
-        crop = frame[bbox[1]:bbox[3], bbox[0]:bbox[2]]
-        if crop.size == 0:
-            keypoints_2d_list.append(np.zeros((17, 2)))
-            out.write(cv2.cvtColor(bg, cv2.COLOR_RGB2BGR))
-            continue
+        if center_2d is None:
+            # No detection - use last known position or skip
+            if len(trajectory_data) > 0:
+                # Use last position
+                last_pos = trajectory_data[-1]['hip_position']
+                center_2d = project_3d_to_2d(last_pos, np.array([[width//4, height//4]]), (width//2, height//2))
+            else:
+                # Store empty data
+                keypoints_2d_list.append(np.zeros(2))
+                out.write(cv2.cvtColor(bg, cv2.COLOR_RGB2BGR))
+                frame_id += 1
+                continue
         
-        # 2D keypoints (from YOLO)
-        if result.keypoints is not None and len(result.keypoints.xy) > 0:
-            kp2d = result.keypoints.xy[0].cpu().numpy()
+        # Store 2D center for camera calibration
+        kp2d_center = np.array([center_2d]) if center_2d is not None else np.zeros((1, 2))
+        keypoints_2d_list.append(kp2d_center[0] if len(kp2d_center) > 0 else np.zeros(2))
+        
+        # Convert 2D center to 3D trajectory point
+        # Estimate depth from mask size if available
+        if mask is not None and bbox is not None:
+            mask_area = np.sum(mask > 0) if isinstance(mask, np.ndarray) else 0
+            # Estimate depth from area (larger area = closer)
+            depth_estimate = 1.0 / (mask_area / (frame.shape[0] * frame.shape[1]) + 0.1)
         else:
-            kp2d = np.zeros((17, 2))
+            depth_estimate = 1.0
         
-        # Store 2D keypoints for camera calibration
-        keypoints_2d_list.append(kp2d.copy())
+        # Create 3D position from 2D center
+        # Normalize coordinates
+        frame_shape_2d = (width//2, height//2)
+        center_normalized = (center_2d - np.array([frame_shape_2d[0]/2, frame_shape_2d[1]/2])) / max(frame_shape_2d)
         
-        # To 3D - pass frame shape for proper camera calibration
-        frame_shape_2d = (width//2, height//2)  # Resized frame dimensions
-        smplx_out = keypoints_to_smplx(kp2d, smplx_model, frame_shape_2d)
-        verts = smplx_out['vertices']
-        joints3d = smplx_out['joints3d']
+        # Create 3D position (X, Y from 2D, Z from depth estimate)
+        position_3d = np.array([
+            center_normalized[0] * 2.0,  # X
+            center_normalized[1] * 2.0,  # Y  
+            depth_estimate * 0.5          # Z (depth)
+        ])
+        
+        # Store trajectory data
+        trajectory_data.append({
+            'frame_id': frame_id,
+            'hip_position': position_3d.copy(),
+            'head_position': position_3d + np.array([0, -0.3, 0.1]),  # Head slightly above
+            'center_of_mass': position_3d.copy()
+        })
+        
+        # For compatibility, create dummy joints3d and vertices
+        joints3d = np.array([position_3d] * 17)  # Dummy keypoints
+        verts = np.array([position_3d] * 100)  # Dummy vertices
         
         # Store intermediate artifacts
         keypoints_3d_list.append({
@@ -525,31 +783,36 @@ def main(video_path: str = "flip_in_beach.mp4"):
             'keypoints_3d': joints3d.copy(),
             'vertices': verts.copy()
         })
-        
-        # Extract trajectory points (hip center, head, left/right feet)
-        # Using approximate joint indices: hip=0, head=~15, left_foot=~10, right_foot=~13
-        hip_pos = joints3d[0] if len(joints3d) > 0 else np.array([0, 0, 0])
-        head_pos = joints3d[15] if len(joints3d) > 15 else joints3d[0] + np.array([0, 0.3, 0])
-        # For trajectory, use hip position as main tracking point
-        trajectory_data.append({
-            'frame_id': frame_id,
-            'hip_position': hip_pos.copy(),
-            'head_position': head_pos.copy(),
-            'center_of_mass': verts.mean(axis=0).copy()  # Center of mass from vertices
-        })
         vertices_list.append(verts.copy())
         
-        # Analyze
-        is_landing = frame_id > 40  # Dummy detection
-        fb = analyze_frame(joints3d, frame_id, is_landing)
+        # Analyze trajectory
+        analysis_result = analyze_trajectory(trajectory_data, frame_id, fps)
+        fb = analysis_result['feedback']
+        score = analysis_result['score']
+        metrics = analysis_result['metrics']
+        
         feedbacks.append(fb)
-        score = 8.0 if "Solid" in fb else 5.0  # Dummy score
         scores.append(score)
-        if "too" in fb or "Low" in fb:
+        
+        # Track mistake frames based on low scores or negative feedback
+        if score < 6.0 or any(keyword in fb.lower() for keyword in ['low', 'erratic', 'decelerating']):
             mistake_frames.append(frame_id)
         
-        # Render
-        rendered = render_frame(verts, bg, fb)
+        # Render frame with trajectory feedback
+        # Display metrics on frame
+        metrics_text = f"Speed: {metrics.get('current_speed', 0):.2f} | Height: {metrics.get('current_height', 0):.2f} | Score: {score:.1f}/10"
+        rendered = render_frame(verts, bg, f"{fb} | {metrics_text}")
+        
+        # Draw SAM3 mask overlay if available
+        if mask is not None:
+            # Convert mask to overlay
+            mask_overlay = (mask > 0.5).astype(np.uint8) * 255 if mask.max() <= 1.0 else (mask > 127).astype(np.uint8) * 255
+            if len(mask_overlay.shape) == 2:
+                mask_overlay = cv2.cvtColor(mask_overlay, cv2.COLOR_GRAY2RGB)
+            # Resize mask to match rendered frame size
+            mask_resized = cv2.resize(mask_overlay, (width, height))
+            # Blend mask with rendered frame (semi-transparent)
+            rendered = cv2.addWeighted(rendered, 0.7, mask_resized, 0.3, 0)
         
         # Pro overlay (every 10th frame for speed)
         if pro_data is not None and frame_id % 10 == 0:
@@ -636,9 +899,12 @@ def main(video_path: str = "flip_in_beach.mp4"):
         orig_frame = original_frames[traj_frame_id]
         orig_frame_resized = cv2.resize(orig_frame, (width, height))
         
-        # Get current vertices and 2D keypoints if available
+        # Get current vertices and 2D center if available
         current_verts = vertices_list[traj_frame_id] if traj_frame_id < len(vertices_list) else None
         current_kp2d = keypoints_2d_list[traj_frame_id] if traj_frame_id < len(keypoints_2d_list) else None
+        # Convert single point to array format for projection function
+        if current_kp2d is not None and len(current_kp2d.shape) == 1:
+            current_kp2d = current_kp2d.reshape(1, -1)
         
         # Render trajectory frame overlaid on original video
         traj_frame = render_trajectory_frame(
@@ -657,8 +923,8 @@ def main(video_path: str = "flip_in_beach.mp4"):
     traj_out.release()
     print(f"✓ Saved trajectory visualization to trajectory_video.mp4")
     
-    # Generate PDF report
-    generate_pdf_report(feedbacks[:10], scores[:10], "feedback_report.pdf")  # Top 10
+    # Generate PDF report based on trajectory analysis
+    generate_pdf_report(trajectory_data, feedbacks, scores, "feedback_report.pdf", fps)
     
     print("\n" + "="*60)
     print("Analysis Complete!")
